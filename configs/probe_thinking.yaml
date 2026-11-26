@@ -1,0 +1,2 @@
+bench: {game: farm, train: {difficulty: 3, seeds: [1000, 1024]}, heldout: {difficulty: 3, seeds: [2000, 2020]}, dev_tests: {}}
+llm: {max_tokens: 12000, extra_body: {chat_template_kwargs: {enable_thinking: true}}}

@@ -1,4 +1,9 @@
 __pycache__/
 *.pyc
 runs/
+cache/
+third_party/cases/
+third_party/SelfImprove-Bench/
+.pytest_cache/
+.venv/
 *.jsonl

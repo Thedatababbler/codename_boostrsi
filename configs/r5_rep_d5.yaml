@@ -1,0 +1,35 @@
+# Round 5 step 9: replication of the seed-0 ensemble (copied, no refit) on fresh d5 items; otherwise = r4_d5.yaml.
+# Round 4 Stage A/B (reduced Part 2): Qwen3-14B with thinking, main difficulty d5.
+# Server: vLLM with --kv-cache-dtype fp8 (cache_tag kvfp8). The test split's y0 plans are the calibration's cached
+# d5 y0 records (generated before the fp8 restart, untagged) and are reused as fixed inputs; every other output
+# (including y0 of the new train/heldout items) is generated under the fp8 setting.
+mode: gbdt
+seed: 0
+lam: auto
+llm:
+  kind: openai
+  api_base: http://127.0.0.1:8401/v1
+  model: qwen3-14b
+  temperature: 0.7
+  max_tokens: 30000
+  max_concurrency: 24
+  timeout: 7200
+  extra_body: {chat_template_kwargs: {enable_thinking: true}}
+  cache_tag: kvfp8
+  y0_cache_tags: [null]
+bench:
+  game: farm
+  train:   {difficulty: 5, seeds: [1000, 1012]}
+  heldout: {difficulty: 5, seeds: [2000, 2030]}
+  dev_tests:
+    rep_d5: {difficulty: 5, seeds: [10000, 10040]}   # round 5 step 9: fresh d5 items, generator seeds never used
+eval: {n_repeats: 1}
+rounds: 3
+patience: 1
+search: {proposer: atomic, policy: f0, top_k: 3, max_steps: 2, min_gain: 0.005, macro_slot: true,
+         slot_mode: one_per_kind}
+loop: {enabled: true, ks: [2, 4, 8], stops: [until_legal, keep_best], slot_pick: random}
+forest: {k: 1}
+sampler: {kind: all}
+baselines: {bon_round: floor}
+fresh_duplicate_stages: true

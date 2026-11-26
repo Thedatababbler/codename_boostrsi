@@ -1,0 +1,1 @@
+bench: {game: farm, train: {difficulty: 2, seeds: [1000, 1012]}, heldout: {difficulty: 2, seeds: [2000, 2001]}, dev_tests: {}}

@@ -1,0 +1,16 @@
+# GBDT + forest preset
+mode: gbdt
+seed: 0
+lam: auto
+bench:
+  game: farm
+  train:   {difficulty: 2, seeds: [1000, 1024]}   # doc: d3 x 40 -- local Qwen3-14B is at the floor on d3 (see notes)
+  heldout: {difficulty: 2, seeds: [2000, 2060]}
+  dev_tests:   # formerly G1 / G2_d3 / G2_d4; evaluated by every run, so development use only
+    dev_d2: {difficulty: 2, seeds: [3000, 3060]}
+    dev_d3: {difficulty: 3, seeds: [4000, 4010]}
+    dev_d4: {difficulty: 4, seeds: [5000, 5010]}
+search: {proposer: random_subspace, policy: f0, top_k: 3, max_steps: 3, min_gain: 0.005}
+forest: {k: 3}
+sampler: {kind: subsample, frac: 0.6}
+rounds: 5
