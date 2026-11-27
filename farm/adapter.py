@@ -45,7 +45,7 @@ def payload_of(P: dict) -> dict:
     return {"toy": P, "duration_days": P["days"], "initial_money": P["cash"], "farmland_count": P["plots"],
             "available_crops": sorted(P["crops"]),
             "crop_catalog": {k: {"maturity_days": c["grow"], "seed_price": c["cost"], "fruit_price": c["price"],
-                                 "yield": 1} for k, c in P["crops"].items()}}
+                                 "yield_per_harvest": 1} for k, c in P["crops"].items()}}
 
 
 def task_prompt(P: dict) -> str:

@@ -24,6 +24,10 @@ def repair_loop(k: int):                   # B3
     return parse_wf(f"seq[draft, loop(k={k}, stop=best)[validate, repair]]")
 
 
+def improve_loop(k: int):                  # B4: the fixed improve baseline (pre-check, user request 2026-11-27)
+    return parse_wf(f"seq[draft, loop(k={k}, stop=best)[improve]]")
+
+
 HANDWRITTEN = {
     "F1_sim_improve": parse_wf("seq[draft, simulate, improve]"),
     "F2_stats_split": parse_wf("seq[crop_stats, draft, branch(status){"
@@ -34,25 +38,25 @@ HANDWRITTEN = {
 
 
 def precheck_methods() -> dict:
-    """F1-F3 plus call-matched B1/B2/B3 (B3 has 1 draft + k repairs = calls)."""
+    """F1-F3 plus call-matched B1 / B2 / B3 / B4 at each F's worst-case call count c
+    (B3 = 1 draft + c-1 repairs, B4 = 1 draft + c-1 improves)."""
     m = {"single_draft": single_draft()}
     m.update(HANDWRITTEN)
     for c in sorted({worst_case_calls(w) for w in HANDWRITTEN.values()}):
         m[f"B1_best_of_{c}"] = best_of(c)
         m[f"B2_tools_best_of_{c}"] = best_of_with_tools(c)
         m[f"B3_repair_loop_k{c - 1}"] = repair_loop(c - 1)
+        m[f"B4_improve_loop_k{c - 1}"] = improve_loop(c - 1)
     return m
 
 
-# Methods whose requests are the multi-agent ones: run with seed_scheme "legacy" so they are served from the
-# multi-agent cache (single_draft = writer_once, B1 = best_of_n_writer, B3 = Stage A's repair loop). Everything
-# else uses seed_scheme "path". diag_mode stays "clean" for all of them (a new comparison), so B3's repairs of
-# legal plans (whose diagnosis contains the reference profit in the original) are new requests.
-LEGACY_SEEDED = ("single_draft", "B1_", "B3_")
+# Everything is generated on this cluster (2026-11-27): every method uses seed_scheme "path" and diag_mode
+# "clean". The legacy scheme (multi-agent repeat indices) is kept only for the toy replay tests.
+LEGACY_SEEDED: tuple = ()
 
 
 def seed_scheme_of(name: str) -> str:
-    return "legacy" if name.startswith(LEGACY_SEEDED) else "path"
+    return "legacy" if LEGACY_SEEDED and name.startswith(LEGACY_SEEDED) else "path"
 
 
 def token_aligned_n(our_tokens_per_item: float, draft_tokens_per_call: float) -> int:

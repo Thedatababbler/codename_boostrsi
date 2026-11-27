@@ -7,6 +7,8 @@ messages, diagnostics) that FakeLLM rules use instead of parsing text.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -263,27 +265,43 @@ class CachedLLM:
         return text, rec["tokens"], {**rec.get("meta", {}), "thinking_chars": think}
 
     def _write_first(self, path: Path, rec: dict) -> dict:
-        """Store rec unless a valid record exists already (then return that one). Exclusive create via link()."""
+        """Store rec unless a valid record exists already (then return that one).
+
+        Safe across processes and nodes sharing one cache directory (NFS included): the check-and-store runs under
+        a POSIX record lock on the shard's lock file (fcntl.lockf, server-side on NFSv4), and the record appears
+        through an atomic link() of a complete temporary file, so readers never see a partial record and the first
+        write wins."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp = path.with_name(f".{path.name}.{os.uname().nodename}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
         try:
-            os.link(tmp, path)
-        except FileExistsError:
-            old = self._read(path)
-            if old is not None:
-                return old
-            os.replace(tmp, path)  # an unreadable (corrupt) record is replaced, as before
-            return rec
-        except OSError:  # file systems without hard links: best effort
-            if self._read(path) is not None:
-                return self._read(path)
-            os.replace(tmp, path)
-            return rec
+            with _shard_lock(path.parent):
+                old = self._read(path)
+                if old is not None:
+                    return old
+                try:
+                    os.link(tmp, path)          # fails if the file exists (written by someone without the lock)
+                except FileExistsError:
+                    old = self._read(path)
+                    if old is not None:
+                        return old
+                    os.replace(tmp, path)       # an unreadable (corrupt) record is replaced, as before
+                except OSError:                 # file systems without hard links: the lock makes this safe
+                    os.replace(tmp, path)
+                return rec
         finally:
             if tmp.exists():
                 tmp.unlink()
-        return rec
+
+
+@contextlib.contextmanager
+def _shard_lock(d: Path):
+    with open(d / ".lock", "a+") as f:
+        fcntl.lockf(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.lockf(f, fcntl.LOCK_UN)
 
 
 def build_llm(cfg, cache_dir: str | Path, fake_rule: Callable | None = None) -> CachedLLM:

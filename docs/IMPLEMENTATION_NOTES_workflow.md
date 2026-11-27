@@ -39,6 +39,68 @@ writer×8 keep_best, then writer×2 keep_best. Each of these is expressible (§R
 requests between the two loop stages, which the round-5 notes found, are reproduced by the legacy scheme by
 construction, because both stages use the same repeat indices. **[inferred]**
 
+## P. Plan of 2026-11-27: everything from scratch on this cluster (overrides §0 and parts of R1, R3)
+
+The user's plan of 2026-11-27 replaces the hand-off to another server: no old cache or runs exist, so
+- acceptance (a) and (b) on real data are dropped (nothing to replay); the toy replay tests stay;
+- every sample is generated here, y0 included (R1's "never generate test y0" no longer applies; `require_cached_y0`
+  is empty); every method uses seed_scheme `path` (legacy stays only for the tests);
+- items: Farm d5 with the multi-agent generator seeds, train 1000-1011, heldout 2000-2029, test 6000-6039. The
+  final-test seeds 9000-9009 are never generated (`final_tests: {}`, make_splits(final_test=False)). **[run]**
+
+### P1. Setup (step 1)
+- SelfImprove-Bench cloned into `third_party/SelfImprove-Bench` (github theseus-labs-rsi/SelfImprove-Bench, HEAD
+  5694387, 2026-11-05; gitignored). `tests/test_bench.py` (the 2 former errors) passes. **[run]**
+- **crop_stats fixed to the real catalog fields.** A real `crop_catalog` entry is {id, name, seed_price,
+  maturity_days, yield_per_harvest, fruit_price}. The earlier guessed yield keys missed `yield_per_harvest`, so on
+  real data crop_stats would have printed only grow days and seed prices. It now prints per crop (best per-day
+  margin first) grow days, profit per plot per cycle = yield_per_harvest * fruit_price - seed_price, per day, and
+  the last planting day that still matures. The toy adapter uses the same field names now. **[run]**
+  Note: the per-day margin equals the task's `reference_daily_profits` (an input of the reference greedy), which
+  the prompt omits. It is computed from the catalog the model sees, and it is neither the reference profit nor the
+  relative score, so it is within the tool boundary as stated; flagged in case that boundary should be stricter.
+  **[run]** (values compared on farm-d5-s1000)
+- `tests/test_tools_real.py` (real benchmark, train seeds 1000/1003/1007/1011): on 24 hand-written legal plans
+  (one crop, repeated plant-harvest-sell cycles, full and half fill, the three cheapest crops), simulate's profit =
+  the scorer's profit = simulate_plan's profit; validate (clean) and simulate contain neither "reference", nor the
+  reference profit, nor the relative score at 3+ decimals. At 2 decimals an idle rate (0.57) coincided with the
+  relative score on s1007, which is not a leak, so the check uses 3+ decimals. An illegal plan's diagnosis carries
+  the failing-day state and no reference profit, so clean = original there. **[run]**
+- **Cross-process cache safety.** `CachedLLM._write_first` stores under a POSIX record lock (fcntl.lockf) on the
+  shard's `.lock` file and makes the record appear through an atomic link() of a complete temporary file; the first
+  write wins, keys are unchanged. `tests/test_llm_race.py::test_processes_sharing_one_cache_first_write_wins`: 6
+  processes miss the same 6 keys at once, on local disk and on the NFS repo filesystem, with and without hard
+  links; every process gets the same record. Removing the lock makes the no-link variant fail. **[run]**
+- **Split by item.** One Slurm job holds all servers of an experiment and the driver
+  (`slurm/serve_and_run.sbatch`). `workflow.llm.RoutedLLM` assigns items to servers round-robin over the sorted ids,
+  so all requests of an item go to one server and no request is generated twice, even across servers.
+  `tests/test_routing.py` (two stub HTTP servers). **[run]**
+- **Why one job.** The account already had 5 jobs running or pending (other work), so under the 6-job limit only
+  one more job fits at a time. The 6-GPU limit is met inside that one job. **[run]** (squeue, 2026-11-27)
+- **Compute.** GPU type for every model server: H200 (partition aiscii). Weights: the local HF cache copy of
+  Qwen/Qwen3-14B (snapshot 40c0698, offline; nothing downloaded). Server: vLLM 0.19.0 + torch cu128 in a new uv env
+  (`envs/boostrsi-vllm-0.19.0`; the earlier scratch envs had been emptied). Identical settings on every server:
+  bf16, --max-model-len 40960, --kv-cache-dtype fp8, --enable-prefix-caching, --gpu-memory-utilization 0.90,
+  --seed 0; per request temperature 0.7, max_tokens 30000, thinking on, seed = the request's repeat index.
+  llm.cache_tag = kvfp8-h200. If the servers do not start without --enforce-eager, all of them restart with it;
+  the choice is in `runs/slurm/job-<id>/server_config.txt`.
+- `models/env.sh` is not sourced (it may hold credentials); HF_HUB_CACHE is set directly.
+
+### P2. Pre-check changes
+- **B4, the fixed improve baseline:** `seq[draft, loop(k=c-1, stop=best)[improve]]` at each F's worst-case calls c.
+- Paired comparisons report the mean difference, the two-sided 90% percentile-bootstrap interval, the one-sided
+  10th percentile (boosttopo bootstrap_lower) and win/tie/loss (tie = equal g). The gate uses the one-sided 10th
+  percentile (revision §12) against the stronger of B1 / B2; informational only, no search is started.
+- Execution: y0 for every item, then one pool over all (method, item) pairs, a checkpoint line per finished pair
+  (`checkpoint.jsonl`); resume skips finished pairs and re-reads finished calls from the cache. On the toy run a
+  restart after 300 of 640 pairs made 0 new calls and gave identical paired results. **[run]**
+- Common random numbers: path seeds hash (run seed, item, path inside the workflow, repeat, step) and not the
+  method name, so identical requests are shared across methods: single draft's draft is also the first draft of
+  F1, B3 and B4; best-of-2's samples are best-of-4's first two; F3's three drafts are B1's first three.
+  **[inferred]** from the seed function; the pairing makes the comparisons tighter, and it means those methods are
+  not independent samples.
+- `scripts/smoke.py`: step 2 of the plan.
+
 ## R. Revision §12 (overrides §3.3, §4.1, §4.2, §7.3 where they disagree)
 
 ### R1. Start from y0; g

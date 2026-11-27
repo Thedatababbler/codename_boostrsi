@@ -79,17 +79,13 @@ def simulate(st, ctx) -> str:
     return _clip(line)
 
 
-_PRICE_KEYS = ("fruit_price", "sell_price", "price")  # [inferred] for the real catalog; toy uses fruit_price
-_YIELD_KEYS = ("yield", "fruit_yield", "harvest_yield")
-
-
-def _first(d: dict, keys):
-    return next((d[k] for k in keys if isinstance(d.get(k), (int, float))), None)
+# SelfImprove-Bench crop_catalog entries: id, name, seed_price, maturity_days, yield_per_harvest, fruit_price
+# (checked on benches/farm/crop_data.json @ 5694387 and on generated d5 tasks).
 
 
 def crop_stats(st, ctx) -> str:
-    """Per crop: days to mature, seed price, profit per plot per cycle and per day (when the catalog has
-    price and yield), latest planting day that still matures."""
+    """Per crop, best per-day margin first: days to mature, profit per plot per cycle
+    (yield_per_harvest * fruit_price - seed_price) and per day, latest planting day that still matures."""
     t = ctx.item.payload
     if "crop_catalog" not in t:
         return "crop stats unavailable for this benchmark"
@@ -98,13 +94,9 @@ def crop_stats(st, ctx) -> str:
     for name in t.get("available_crops") or sorted(cat):
         c = cat[name]
         m, seed = c["maturity_days"], c["seed_price"]
-        price, yld = _first(c, _PRICE_KEYS), _first(c, _YIELD_KEYS)
-        if price is not None and yld is not None:
-            margin = yld * price - seed
-            rows.append((-margin / m, f"{name}: grow={m}d, profit/plot/cycle={margin:g}, per-day={margin / m:.2f}, "
-                                      f"last plant day={D - m}"))
-        else:
-            rows.append((0.0, f"{name}: grow={m}d, seed={seed}, last plant day={D - m}"))
+        margin = c["yield_per_harvest"] * c["fruit_price"] - seed
+        rows.append((-margin / m, f"{name}: grow={m}d, profit/plot/cycle={margin:g}, per-day={margin / m:.2f}, "
+                                  f"last plant day={D - m}"))
     return _clip("; ".join(r for _, r in sorted(rows, key=lambda x: x[0])))
 
 

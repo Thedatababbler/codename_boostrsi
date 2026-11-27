@@ -7,6 +7,8 @@ import os
 import statistics
 from collections import Counter
 
+from boosttopo.boost.residual import bootstrap_lower
+
 from .evaluate import Env, evaluate
 from .model import to_str
 from .stats import mean_ci, paired_diffs
@@ -38,10 +40,10 @@ def make_bench(cfg):
     return mb(cfg)
 
 
-def make_env(cfg, cache_only: bool = False, bench=None) -> Env:
+def make_env(cfg, cache_only: bool = False, bench=None, call_log: str | None = None) -> Env:
     from .llm import make_llm
     w = cfg.workflow
-    return Env(make_llm(cfg, cache_only), bench or make_bench(cfg), seed_scheme=w.seed_scheme,
+    return Env(make_llm(cfg, cache_only, call_log), bench or make_bench(cfg), seed_scheme=w.seed_scheme,
                diag_mode=w.diag_mode, start=w.start, workers=int(cfg.llm.get("max_concurrency", 8)))
 
 
@@ -122,5 +124,9 @@ def compare(rows_a: list[dict], rows_b: list[dict]) -> dict:
         elif B[k]["legal"] and A[k]["legal"]:
             up += d
     n = max(1, len(set(A) & set(B)))
-    return {"diff": m, "lo": lo, "hi": hi, "from_illegal_to_legal": fixed / n,
-            "from_legal_score_up": up / n}
+    d = paired_diffs(ga, gb)
+    return {"diff": m, "lo": lo, "hi": hi,                       # two-sided 90% percentile-bootstrap interval
+            "p10": bootstrap_lower(d, 0.9) if d else 0.0,       # one-sided: 10th percentile of the bootstrap
+            "win": sum(x > 1e-12 for x in d), "tie": sum(abs(x) <= 1e-12 for x in d),
+            "loss": sum(x < -1e-12 for x in d), "n": len(d),
+            "from_illegal_to_legal": fixed / n, "from_legal_score_up": up / n}

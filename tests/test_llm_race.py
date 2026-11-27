@@ -44,3 +44,63 @@ def test_identical_inflight_requests_merged_and_first_write_kept(tmp_path):
     assert llm._write_first(p2, {"text": "second", "tokens": 2})["text"] == "first"
     assert json.loads(p2.read_text())["text"] == "first"
     assert llm.call(other)[0] == "first"
+
+
+# ----------------------------------------------------------------------------- across processes
+
+def _proc(cache_dir, barrier, q, no_link):
+    import os
+    import time
+
+    from boosttopo.llm import CachedLLM, FakeLLM, Request
+    if no_link:  # a file system without hard links: only the shard lock protects the store
+        def _nolink(*a, **k):
+            raise OSError("no hard links")
+        os.link = _nolink
+
+    def rule(r):
+        time.sleep(0.05)
+        return f"from-{os.getpid()}"
+
+    llm = CachedLLM(FakeLLM(rule), cache_dir)
+    barrier.wait()
+    outs = [llm.call(Request(f"prompt {i}", rep=0))[0] for i in range(6)]
+    q.put(outs)
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("where", ["local", "repo_fs"])
+@pytest.mark.parametrize("no_link", [False, True])
+def test_processes_sharing_one_cache_first_write_wins(tmp_path, where, no_link):
+    """Several processes miss the same keys at once (worst case; the runs split work by item so this should not
+    happen): each may generate, but every process gets the same record, the one stored first."""
+    import multiprocessing as mp
+    import shutil
+    import uuid
+    from pathlib import Path
+
+    d = tmp_path if where == "local" else Path("runs") / f".race_{uuid.uuid4().hex[:8]}"  # repo fs = NFS here
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        ctx = mp.get_context("fork")
+        n = 6
+        barrier, q = ctx.Barrier(n), ctx.Queue()
+        ps = [ctx.Process(target=_proc, args=(str(d), barrier, q, no_link)) for _ in range(n)]
+        for p in ps:
+            p.start()
+        res = [q.get(timeout=60) for _ in ps]
+        for p in ps:
+            p.join(timeout=60)
+            assert p.exitcode == 0
+        for i in range(6):
+            got = {r[i] for r in res}
+            assert len(got) == 1, got  # every process returned the same record
+            llm = CachedLLM(FakeLLM(lambda r: "unused"), d)
+            k = llm.key(Request(f"prompt {i}", rep=0))
+            assert json.loads((d / "llm" / k[:2] / f"{k}.json").read_text())["text"] == got.pop()
+        assert not list((d / "llm").rglob("*.tmp"))
+    finally:
+        if where != "local":
+            shutil.rmtree(d, ignore_errors=True)
