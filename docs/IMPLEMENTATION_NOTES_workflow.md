@@ -101,6 +101,19 @@ The user's plan of 2026-11-27 replaces the hand-off to another server: no old ca
   not independent samples.
 - `scripts/smoke.py`: step 2 of the plan.
 
+### P3. Runs of 2026-11-27 (all numbers **[run]** unless marked)
+- Slurm bug fixed: aiscii nodes do not hide unallocated GPUs, so counting GPUs with nvidia-smi started a second server
+  on another job's GPU (job 4320351, cancelled after 7 min). The job now uses only CUDA_VISIBLE_DEVICES.
+- Servers started without --enforce-eager (CUDA graphs on), on H200 (aisciit01 for the smoke, 6 GPUs on one node for
+  the pre-check).
+- Smoke (job 4320374, 1 H200, 14.9 min): y0 legal 10/12, mean score 0.442; writer legal 9/12, mean score 0.446;
+  0/29 truncated; 16.3k-18.3k tokens per call; 133-156 calls/h/GPU at 12 concurrent requests. improve from a legal
+  plan: 1/5 legal (s1002: 0.94 -> 1.18); the 4 illegal ones break funds or maturity. No stop rule fired.
+  File: runs/smoke_d5/smoke.json, runs/smoke_d5/improve_io.json.
+- Pre-check (job 4320382, 6 H200, 75.8 min): 783 new calls, 0 truncated, 1820 logical calls; 105 calls/GPU-hour over
+  the whole job (tail included). Results: runs/precheck_d5/summary.json. No F passes the one-sided gate.
+- GPU-hours: 0.12 (cancelled) + 0.25 (smoke) + 7.58 (pre-check) = 7.95.
+
 ## R. Revision §12 (overrides §3.3, §4.1, §4.2, §7.3 where they disagree)
 
 ### R1. Start from y0; g

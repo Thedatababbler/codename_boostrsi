@@ -29,7 +29,11 @@ mkdir -p "$VLLM_CACHE_ROOT"
 export PATH=$E/bin:/usr/bin:/bin
 MODEL=$HF_HUB_CACHE/models--Qwen--Qwen3-14B/snapshots/40c069824f4251a91eefaf281ebe4c544efd3e18
 HOST=${SLURMD_NODENAME}
-NGPU=$(nvidia-smi -L | wc -l)
+# Only the GPUs Slurm allocated: aiscii nodes do not hide the other GPUs (nvidia-smi lists all 8), so the list
+# comes from CUDA_VISIBLE_DEVICES as set by Slurm (job 4320351 started a server on a GPU of another job).
+: "${CUDA_VISIBLE_DEVICES:?Slurm did not set CUDA_VISIBLE_DEVICES}"
+IFS=, read -ra GPUS <<< "$CUDA_VISIBLE_DEVICES"
+NGPU=${#GPUS[@]}
 BASE=$((20000 + (SLURM_JOB_ID % 2000) * 8))
 OUT=$REPO/runs/slurm/job-$SLURM_JOB_ID
 mkdir -p "$OUT"
@@ -37,7 +41,9 @@ cd "$REPO"
 PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; }
 trap cleanup EXIT
-nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader | tee "$OUT/gpus.txt"
+nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=index,name,memory.total,memory.used,driver_version --format=csv,noheader \
+  | tee "$OUT/gpus.txt"
+[ "$(wc -l < "$OUT/gpus.txt")" = "$NGPU" ] || { echo "GPU list mismatch"; exit 2; }
 if [ "$(cut -d, -f2 "$OUT/gpus.txt" | sort -u | wc -l)" != 1 ]; then echo "mixed GPU types"; exit 2; fi
 
 COMMON=(--served-model-name qwen3-14b --host 0.0.0.0 --dtype bfloat16 --max-model-len 40960 --kv-cache-dtype fp8
@@ -49,7 +55,7 @@ for cfg in "${CONFIGS[@]}"; do
   echo "=== starting $NGPU servers, extra args: '${cfg}'"
   for i in $(seq 0 $((NGPU - 1))); do
     # shellcheck disable=SC2086
-    CUDA_VISIBLE_DEVICES=$i vllm serve "$MODEL" "${COMMON[@]}" --port $((BASE + i)) $cfg > "$OUT/vllm-$i.log" 2>&1 &
+    CUDA_VISIBLE_DEVICES=${GPUS[$i]} vllm serve "$MODEL" "${COMMON[@]}" --port $((BASE + i)) $cfg > "$OUT/vllm-$i.log" 2>&1 &
     PIDS+=($!)
   done
   for t in $(seq 1 180); do                       # up to 30 min to load
