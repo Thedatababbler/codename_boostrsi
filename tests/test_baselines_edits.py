@@ -2,7 +2,7 @@
 import random
 import unittest
 
-from farm.bench import gen_items
+from farm.adapter import gen_items
 from workflow import baselines
 from workflow.edits import FRAGMENTS, Edit, Fragment, apply_edit, legal_edits
 from workflow.evaluate import evaluate
@@ -10,7 +10,7 @@ from workflow.model import (Limits, get, iter_nodes, make_step, parse_wf, seq, t
                             worst_case_calls)
 from workflow.policy import F0Policy
 from workflow.proposer import WorkflowProposer
-from workflow.skills import TEMPLATES
+from workflow.skills import request
 
 from helpers import fake_env
 
@@ -40,9 +40,23 @@ class TestBaselines(unittest.TestCase):
         self.assertEqual(baselines.token_aligned_n(10, 3333), 1)
         self.assertEqual(baselines.token_aligned_k(10000, 3000, 3000), 2)
 
-    def test_same_template_with_or_without_tools(self):
-        self.assertIn("{crops}", TEMPLATES["draft"])
-        self.assertIn("{sim}", TEMPLATES["improve"])
+    def test_role_prompts_unchanged_and_tool_sections(self):
+        from boosttopo.roles import _TAIL_WRITER, role_prompt
+        from workflow.model import State
+        from helpers import ILLEGAL, ITEM
+        st = State(problem=ITEM.prompt, plan=ILLEGAL, diag="illegal plan: x", notes={"analysis": "use corn"})
+        # without tool output the prompt is byte-identical to the multi-agent role prompt
+        self.assertEqual(request("draft", st, ITEM, 7).prompt,
+                         role_prompt("writer", ITEM, ILLEGAL, [("analyst", "use corn")], None, rep=7).prompt)
+        self.assertEqual(request("repair", st, ITEM, 7).prompt,
+                         role_prompt("repairer", ITEM, ILLEGAL, [("analyst", "use corn")], "illegal plan: x").prompt)
+        self.assertEqual(request("analyze", st, ITEM, 7).prompt, role_prompt("analyst", ITEM, ILLEGAL, [], None).prompt)
+        # a tool section sits before the ledger tail; improve has the tail too
+        st.notes["crops"] = "corn: grow=3d"
+        p = request("draft", st, ITEM, 7).prompt
+        self.assertTrue(p.endswith(_TAIL_WRITER))
+        self.assertIn("=== CROP STATS (tool output) ===\ncorn: grow=3d" + _TAIL_WRITER, p)
+        self.assertTrue(request("improve", st, ITEM, 7).prompt.endswith(_TAIL_WRITER))
 
 
 class TestEdits(unittest.TestCase):
@@ -111,7 +125,7 @@ class TestEdits(unittest.TestCase):
         self.assertTrue(set(map(str, c)).isdisjoint(map(str, c3)))
 
     def test_no_tools_edit_set(self):
-        allowed = {"draft", "repair", "improve", "analyze", "validate", "reset_to_best"}
+        allowed = {"draft", "repair", "improve", "analyze", "validate"}
         es = legal_edits(parse_wf("seq[draft]"), Limits(), allowed_steps=allowed,
                          allowed_fragments={"repair_loop", "multi_draft"})
         for e in es:

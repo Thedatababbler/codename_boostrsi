@@ -1,50 +1,75 @@
 """Shared experiment plumbing: environment construction, running method sets, metrics (§8.2)."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import statistics
 from collections import Counter
 
 from .evaluate import Env, evaluate
-from .llm import CachedLLM, OpenAICompatLLM
 from .model import to_str
 from .stats import mean_ci, paired_diffs
 
 
-def make_env(args) -> Env:
-    from farm.bench import FarmBench
-    if args.llm == "fake":
-        from .fake import FakeFarmLLM
-        inner = FakeFarmLLM()
-    else:
-        if not args.base_url or not args.model:
-            raise SystemExit("--base-url and --model are required for --llm openai")
-        inner = OpenAICompatLLM(args.base_url, args.model, api_key=os.environ.get(args.api_key_env)
-                                if args.api_key_env else None)
-    llm = CachedLLM(inner, args.cache, max_concurrency=args.concurrency)
-    return Env(llm, FarmBench(), {"status_threshold": args.status_threshold,
-                                  "status_mode": args.status_mode},
-               workers=args.workers)
+WORKFLOW_DEFAULTS = {
+    "workflow": {"seed_scheme": "path", "diag_mode": "clean", "start": "y0", "max_calls": 12,
+                 "require_cached_y0": ["test_d5"]},
+    "boost": {"rounds": 4, "patience": 2, "max_steps": 4, "top_k": 3, "fresh_after_reject": True},
+}
+
+
+def load_cfg(path: str | None, sets: list[str] = ()):
+    """configs/*.yaml + --set a.b=c overrides, over boosttopo's defaults and the workflow defaults."""
+    from boosttopo.config import DEFAULTS, deep_merge, load_config, parse_override
+    import yaml
+    over: dict = {}
+    for s_ in sets:
+        over = deep_merge(over, parse_override(s_))
+    raw = yaml.safe_load(open(path, encoding="utf-8")) if path else {}
+    return load_config(None, deep_merge(deep_merge(WORKFLOW_DEFAULTS, raw or {}), over))
+
+
+def make_bench(cfg):
+    if cfg.bench.game == "farm-toy":
+        from farm.adapter import ToyFarmAdapter
+        return ToyFarmAdapter()
+    from boosttopo.bench.base import make_bench as mb
+    return mb(cfg)
+
+
+def make_env(cfg, cache_only: bool = False, bench=None) -> Env:
+    from .llm import make_llm
+    w = cfg.workflow
+    return Env(make_llm(cfg, cache_only), bench or make_bench(cfg), seed_scheme=w.seed_scheme,
+               diag_mode=w.diag_mode, start=w.start, workers=int(cfg.llm.get("max_concurrency", 8)))
+
+
+def make_splits(cfg, bench) -> dict:
+    """boosttopo.run.make_splits: train, heldout, dev tests; never the final-test splits."""
+    from boosttopo.run import make_splits as ms
+    return ms(cfg, bench, final_test=False)
 
 
 def add_common_args(ap):
-    ap.add_argument("--llm", choices=["fake", "openai"], default="fake")
-    ap.add_argument("--base-url", default=None, help="OpenAI-compatible endpoint, e.g. http://localhost:8000/v1")
-    ap.add_argument("--model", default=None, help="served model name, e.g. Qwen/Qwen3-14B")
-    ap.add_argument("--api-key-env", default=None, help="name of an env var holding the key (optional)")
-    ap.add_argument("--cache", default="runs/cache/llm.jsonl")
-    ap.add_argument("--concurrency", type=int, default=4, help="max concurrent model requests")
-    ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--difficulty", type=int, default=5)
-    ap.add_argument("--status-threshold", type=float, default=0.8)
-    ap.add_argument("--status-mode", choices=["score", "bound"], default="score")
+    ap.add_argument("--config", required=True, help="configs/*.yaml (boosttopo format + workflow / boost blocks)")
+    ap.add_argument("--set", action="append", default=[], help="override, e.g. --set llm.max_concurrency=24")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--out", default="runs/out")
+    ap.add_argument("--out", default=None, help="run directory (default runs/<config stem>)")
 
 
-def run_methods(methods: dict, items, env: Env, run_seed: int = 0) -> dict:
-    return {name: evaluate(wf, items, env, run_seed) for name, wf in methods.items()}
+def with_scheme(env: Env, scheme: str) -> Env:
+    """The same environment (shared LLM, y0, locks) with another seed scheme."""
+    return dataclasses.replace(env, seed_scheme=scheme)
+
+
+def run_methods(methods: dict, items, env: Env, run_seed: int = 0, scheme_of=None) -> dict:
+    env.make_start([it for it in items if it.item_id not in env.y0])
+    out = {}
+    for name, wf in methods.items():
+        e = with_scheme(env, scheme_of(name)) if scheme_of else env
+        out[name] = evaluate(wf, items, e, run_seed)
+    return out
 
 
 def dump(path: str, methods: dict, results: dict, extra: dict | None = None):
@@ -74,8 +99,9 @@ def method_metrics(rows: list[dict]) -> dict:
     return {
         "n": len(rows), "mean_g": f(r["g"] for r in rows), "mean_score": f(r["score"] for r in rows),
         "legal_rate": len(legal) / max(1, len(rows)),
-        "legal_mean_raw": f(r["raw"] for r in legal) if legal else None,
+        "legal_mean_score": f(r["score"] for r in legal) if legal else None,
         "tokens": f(x["tokens"] for x in c), "llm_calls": f(x["llm_calls"] for x in c),
+        "new_llm_calls": sum(x["new_llm_calls"] for x in c),
         "scorer_calls": f(x["scorer_calls"] for x in c), "tool_calls": f(x["tool_calls"] for x in c),
         "branch_usage": dict(branches), "loop_iterations": dict(sorted(loops.items())),
     }

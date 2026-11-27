@@ -58,10 +58,12 @@ class F0Policy:
 
 
 def residual_source(results, weights: dict | None = None) -> dict:
-    """Sum residual weight by where it comes from: illegal vs legal_low vs legal_high plans."""
+    """Sum residual weight by where it comes from: illegal vs legal_low vs legal_high plans (the status labels
+    of the output plan, from ScoreResult.category)."""
+    from .tools import STATUS_OF
     out = {"illegal": 0.0, "legal_low": 0.0, "legal_high": 0.0}
     for r in results:
-        w = weights.get(r.item_id, 1.0) if weights else max(0.0, 1.0 - r.score)
-        key = "illegal" if not r.legal else ("legal_low" if r.score < 0.8 else "legal_high")
+        w = weights.get(r.item_id, 1.0) if weights else max(0.0, 1.0 - r.g)
+        key = "illegal" if not r.legal else STATUS_OF.get(r.category, "legal_low")
         out[key] += w
     return out

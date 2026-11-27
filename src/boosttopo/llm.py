@@ -166,6 +166,10 @@ class CachedLLM:
         self.dir = Path(cache_dir) / "llm"
         self.budget = budget or Budget()
         self._lock = threading.Lock()
+        # In-flight requests by cache key: a second identical request waits for the first one's result instead of
+        # generating again (vLLM gives different outputs for one seed under different batch composition, so two
+        # concurrent misses used to store two different samples, the last write winning).
+        self._inflight: dict[str, threading.Event] = {}
         # Round 4: names whose cached y0 (start solution) records are reused read-only before generating y0 under
         # this client's own name (e.g. y0 generated before a server-setting change, kept as fixed inputs).
         self.y0_names = [self.name_of(inner, t) for t in y0_tags]
@@ -206,34 +210,80 @@ class CachedLLM:
 
     def call_meta(self, req: Request) -> tuple[str, int, dict]:
         """As call(), plus the call metadata stored with the cache record (empty for records written before
-        metadata was kept, or for inner LLMs without call_meta). The cache key is unchanged."""
+        metadata was kept, or for inner LLMs without call_meta). The cache key is unchanged.
+
+        Identical requests in flight at the same time are merged: only the first one calls the model, the others
+        wait and get its record. A record is never overwritten: if the file already exists when a generated
+        output is about to be stored (another process wrote it first), the stored record wins and is returned."""
         k = self.key(req)
         path = self.dir / k[:2] / f"{k}.json"
-        if path.exists():
-            try:
-                rec = json.loads(path.read_text(encoding="utf-8"))
-                with self._lock:
-                    self.budget.logical_calls += 1
-                    self.budget.logical_tokens += rec["tokens"]
-                text, think = strip_thinking(rec["text"])
-                return text, rec["tokens"], {**rec.get("meta", {}), "thinking_chars": think}
-            except (json.JSONDecodeError, KeyError):
-                pass
-        if hasattr(self.inner, "call_meta"):
-            text, tokens, meta = self.inner.call_meta(req)
-        else:
-            (text, tokens), meta = self.inner.call(req), {}
-        rec = {"text": text, "tokens": tokens, "model": self.name}
-        if meta:
-            rec["meta"] = meta
-        atomic_write_json(path, rec)
+        while True:
+            hit = self._read(path)
+            if hit is not None:
+                return self._hit(hit)
+            with self._lock:
+                ev = self._inflight.get(k)
+                if ev is None:
+                    self._inflight[k] = threading.Event()
+                    break
+            ev.wait()  # then read the leader's record from disk (if the leader failed, become the leader)
+        try:
+            if hasattr(self.inner, "call_meta"):
+                text, tokens, meta = self.inner.call_meta(req)
+            else:
+                (text, tokens), meta = self.inner.call(req), {}
+            rec = {"text": text, "tokens": tokens, "model": self.name}
+            if meta:
+                rec["meta"] = meta
+            stored = self._write_first(path, rec)
+            with self._lock:
+                self.budget.new_calls += 1
+                self.budget.new_tokens += tokens
+        finally:
+            with self._lock:
+                self._inflight.pop(k).set()
+        return self._hit(stored)
+
+    @staticmethod
+    def _read(path: Path):
+        if not path.exists():
+            return None
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+            rec["text"], rec["tokens"]
+            return rec
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+
+    def _hit(self, rec: dict) -> tuple[str, int, dict]:
         with self._lock:
             self.budget.logical_calls += 1
-            self.budget.logical_tokens += tokens
-            self.budget.new_calls += 1
-            self.budget.new_tokens += tokens
-        text, think = strip_thinking(text)  # the raw output (with the reasoning) stays in the cache record
-        return text, tokens, {**meta, "thinking_chars": think}
+            self.budget.logical_tokens += rec["tokens"]
+        text, think = strip_thinking(rec["text"])  # the raw output (with the reasoning) stays in the cache record
+        return text, rec["tokens"], {**rec.get("meta", {}), "thinking_chars": think}
+
+    def _write_first(self, path: Path, rec: dict) -> dict:
+        """Store rec unless a valid record exists already (then return that one). Exclusive create via link()."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            old = self._read(path)
+            if old is not None:
+                return old
+            os.replace(tmp, path)  # an unreadable (corrupt) record is replaced, as before
+            return rec
+        except OSError:  # file systems without hard links: best effort
+            if self._read(path) is not None:
+                return self._read(path)
+            os.replace(tmp, path)
+            return rec
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        return rec
 
 
 def build_llm(cfg, cache_dir: str | Path, fake_rule: Callable | None = None) -> CachedLLM:

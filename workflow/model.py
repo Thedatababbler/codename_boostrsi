@@ -24,8 +24,9 @@ class State:
     # --- executor-maintained (deviation, see docs/IMPLEMENTATION_NOTES.md) ---
     plan_score: float = 0.0           # score of the *current* plan
     plan_legal: bool = False          # legality of the *current* plan
-    raw_best: float = 0.0             # uncapped score of best_plan (for §8.2 breakdown)
+    plan_cat: str = ""                # ScoreResult.category of the current plan (status / error_type checks)
     best_legal: bool = False
+    best_cat: str = ""
     trace: list = field(default_factory=list)  # execution trace events
 
     def copy(self) -> "State":
@@ -33,7 +34,9 @@ class State:
 
 
 # Fields readable from the start. `notes` is always readable (missing keys render empty, §3.4).
-INITIAL_FIELDS = frozenset({"problem", "notes", "best_score"})
+# Revision §12: every workflow starts from y0 (plan = best_plan = y0), so plan is readable from the start.
+# With `start: empty` the plan is the empty string, which the writer prompt also accepts.
+INITIAL_FIELDS = frozenset({"problem", "notes", "best_score", "plan", "best_plan"})
 
 
 def field_root(f: str) -> str:
@@ -60,7 +63,7 @@ def _freeze(params: dict) -> tuple:
 
 @dataclass(frozen=True)
 class Block:
-    kind: str                 # "seq" | "loop" | "branch" | "fanout"
+    kind: str                 # "seq" | "loop" | "branch" | "fanout" | "gate"
     children: tuple = ()
     # stored frozen as sorted (key, value) pairs; use .params for a dict view.
     # branch: {"check": name, "labels": tuple-of-labels parallel to children}
@@ -99,8 +102,18 @@ def seq(*children) -> Block:
     return Block("seq", tuple(children))
 
 
-def loop(*children, k: int = 3, stop: str = "legal") -> Block:
-    return Block("loop", tuple(children), _freeze({"k": k, "stop": stop}))
+def loop(*children, k: int = 3, stop: str = "legal", budget: int | None = None) -> Block:
+    p = {"k": k, "stop": stop}
+    if budget is not None:
+        p["budget"] = budget          # stop before a repetition once the item's tokens (incl. y0) reach it
+    return Block("loop", tuple(children), _freeze(p))
+
+
+def gate(*children, occ: int = 0) -> Block:
+    """One gated stage (the multi-agent GBDT member): its output replaces the input plan only if it scores
+    strictly higher; notes written inside are stage-local. occ = occurrence index among same-structure members
+    (legacy seeds only)."""
+    return Block("gate", tuple(children), _freeze({"occ": occ}) if occ else ())
 
 
 def fanout(*children, n: int = 3) -> Block:
@@ -127,21 +140,21 @@ def body(node: Block) -> Block:
 # this module only needs signatures for legality checks, so it stays import-light.
 
 SKILL_SIGS = {
-    "draft":   (("problem", "notes"), "plan"),
-    "repair":  (("problem", "plan", "diag"), "plan"),
-    "improve": (("problem", "plan", "notes"), "plan"),
-    "analyze": (("problem", "notes"), "notes.analysis"),
+    "draft":    (("problem", "plan", "notes"), "plan"),           # writer role on the current plan
+    "repair":   (("problem", "plan", "diag", "notes"), "plan"),   # repairer role
+    "improve":  (("problem", "plan", "notes"), "plan"),           # new skill
+    "analyze":  (("problem", "notes"), "notes.analysis"),         # analyst role
+    "critique": (("problem", "plan", "notes"), "notes.critique"), # critic role (legacy ensembles; not in edits)
 }
 TOOL_SIGS = {
-    "validate":      (("plan",), "diag"),
-    "simulate":      (("plan",), "notes.sim"),
-    "crop_stats":    (("problem",), "notes.crops"),
-    "reset_to_best": (("best_plan",), "plan"),
+    "validate":   (("plan",), "diag"),
+    "simulate":   (("plan",), "notes.sim"),
+    "crop_stats": (("problem",), "notes.crops"),
 }
 # check name -> (fields it needs, possible labels)
 CHECK_SIGS = {
     "status":     (("plan",), ("illegal", "legal_low", "legal_high")),
-    "error_type": (("diag",), ("funds", "not_mature", "farmland", "other")),
+    "error_type": (("plan",), ("funds", "farmland", "not_mature", "inventory", "other", "none")),
 }
 
 
@@ -165,7 +178,7 @@ def make_step(name: str) -> Step:
 class Limits:
     max_depth: int = 3        # block nesting depth, root seq = 1
     max_llm_steps: int = 6    # static count of llm steps
-    max_calls: int = 8        # worst-case llm calls
+    max_calls: int = 12       # worst-case llm calls (revision §12)
     k_values: tuple = (2, 3, 5)
     n_values: tuple = (2, 3, 5)
 
@@ -227,7 +240,7 @@ def worst_case_calls(node: Node) -> int:
     """Loops count k times, fanouts n times, branches their most expensive case (§2.4)."""
     if isinstance(node, Step):
         return 1 if node.kind == "llm" else 0
-    if node.kind == "seq":
+    if node.kind in ("seq", "gate"):
         return sum(worst_case_calls(c) for c in node.children)
     inner = sum(worst_case_calls(c) for c in node.children)
     if node.kind == "loop":
@@ -254,11 +267,15 @@ def _defined_after(node: Node, defined: frozenset, errors: list, path: tuple) ->
         if w == "plan":
             out = out | {"best_plan"}  # executor updates best_plan whenever plan is written
         return frozenset(out)
-    if node.kind in ("seq", "loop", "fanout"):
+    if node.kind in ("seq", "loop", "fanout", "gate"):
         d = defined
         for i, c in enumerate(node.children):
             d = _defined_after(c, d, errors, path + (i,))
-        return d  # loop / fanout bodies always run at least once
+        if node.kind == "loop":
+            return defined  # the stop check runs before every repetition, so a loop may run zero times
+        if node.kind == "gate":
+            return defined  # diag and notes written inside a gate are stage-local
+        return d  # a fanout body always runs (n >= 1)
     if node.kind == "branch":
         check = node.params["check"]
         if check not in CHECK_SIGS:
@@ -292,16 +309,18 @@ def validate(wf: Block, limits: Limits = Limits(), require_plan: bool = True,
                 errs.append(f"{path}: unknown {n.kind} step {n.name!r}")
             continue
         p = n.params
-        if n.kind not in ("seq", "loop", "branch", "fanout"):
+        if n.kind not in ("seq", "loop", "branch", "fanout", "gate"):
             errs.append(f"{path}: unknown block kind {n.kind!r}")
         if n.kind == "loop":
             if not isinstance(p.get("k"), int) or p["k"] < 1:
                 errs.append(f"{path}: loop k must be a positive int")
             if p.get("stop") not in ("legal", "best"):
                 errs.append(f"{path}: loop stop must be 'legal' or 'best'")
+            if "budget" in p and (not isinstance(p["budget"], int) or p["budget"] < 1):
+                errs.append(f"{path}: loop budget must be a positive int (tokens)")
         if n.kind == "fanout" and (not isinstance(p.get("n"), int) or p["n"] < 1):
             errs.append(f"{path}: fanout n must be a positive int")
-        if n.kind in ("loop", "fanout") and not writes_plan(n):
+        if n.kind in ("loop", "fanout", "gate") and not writes_plan(n):
             errs.append(f"{path}: {n.kind} body must contain a step that writes plan")
         if n.kind == "branch":
             labels = p.get("labels", ())
@@ -370,7 +389,7 @@ def parse(text: str) -> Node:
 
     def node():
         name = eat()
-        if name not in ("seq", "loop", "fanout", "branch"):
+        if name not in ("seq", "loop", "fanout", "branch", "gate"):
             return make_step(name)
         params: dict = {}
         if peek() == "(":
@@ -406,7 +425,9 @@ def parse(text: str) -> Node:
         if name == "seq":
             return seq(*ch)
         if name == "loop":
-            return loop(*ch, k=params.get("k", 3), stop=params.get("stop", "legal"))
+            return loop(*ch, k=params.get("k", 3), stop=params.get("stop", "legal"), budget=params.get("budget"))
+        if name == "gate":
+            return gate(*ch, occ=params.get("occ", 0))
         return fanout(*ch, n=params.get("n", 3))
 
     out = node()

@@ -6,7 +6,7 @@ from boost.branch import _View, attach_case, fit_branch
 from boost.common import BoostCfg, group_sum, residual_weights
 from boost.global_search import fit_global
 from boost.serial import attach_tail, fit_serial, tail_results
-from farm.bench import gen_items
+from farm.adapter import gen_items
 from workflow.evaluate import evaluate
 from workflow.grow import GrowCfg
 from workflow.model import iter_nodes, parse_wf, to_str
@@ -46,9 +46,9 @@ class TestSerial(unittest.TestCase):
             self.assertEqual(t.score, f.score)                         # same samples
             if p.score < 1.0:
                 self.assertEqual(t.cost.tokens + p.cost.tokens, f.cost.tokens)  # tail pays only itself
-        n = env.llm.new_calls
+        n = env.llm.budget.new_calls
         tail_results(base, frag, TRAIN, env, 0)
-        self.assertEqual(env.llm.new_calls, n)                         # frozen + cached
+        self.assertEqual(env.llm.budget.new_calls, n)                         # frozen + cached
 
 
 class TestBranch(unittest.TestCase):
@@ -105,7 +105,7 @@ class TestBranch(unittest.TestCase):
         V = _View(wf, TRAIN, env, 0)
         full = {r.item_id: r for r in evaluate(wf, TRAIN, env)}
         for i in TRAIN:
-            self.assertEqual(V.cur[i.id].score, full[i.id].score)
+            self.assertEqual(V.cur[i.item_id].score, full[i.item_id].score)
 
 
 class TestAblationSwitches(unittest.TestCase):
@@ -136,3 +136,19 @@ class TestAblationSwitches(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResume(unittest.TestCase):
+    def test_resume_after_a_round_equals_one_run(self):
+        import tempfile
+        from boosttopo.runlog import RunLog
+        d = tempfile.mkdtemp()
+        cache = tempfile.mkdtemp()
+        full, info_full = fit_serial(TRAIN, HELD, fake_env(cache), BoostCfg(**{**CFG.__dict__, "rounds": 3}))
+        part, info_part = fit_serial(TRAIN, HELD, fake_env(cache), BoostCfg(**{**CFG.__dict__, "rounds": 2}),
+                                     runlog=RunLog(d))
+        env = fake_env(cache)
+        res, info_res = fit_serial(TRAIN, HELD, env, BoostCfg(**{**CFG.__dict__, "rounds": 3}), runlog=RunLog(d))
+        self.assertEqual(to_str(res), to_str(full))
+        self.assertEqual([r["frag"] for r in info_res["rounds"]], [r["frag"] for r in info_full["rounds"]])
+        self.assertEqual(env.llm.budget.new_calls, 0)  # everything replayed from the cache

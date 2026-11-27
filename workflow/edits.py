@@ -15,7 +15,8 @@ from .model import (CHECK_SIGS, SKILL_SIGS, Block, Limits, Step, branch, fanout,
 
 CONTROL_OPS = ("wrap_loop", "wrap_fanout", "add_branch", "set_param")
 OTHER_OPS = ("insert_step", "remove", "replace_skill", "unwrap")
-TOOL_STEPS = ("validate", "simulate", "crop_stats", "reset_to_best")
+TOOL_STEPS = ("validate", "simulate", "crop_stats")
+EDIT_SKILLS = ("draft", "repair", "improve", "analyze")  # critique exists only to express multi-agent ensembles
 
 
 @dataclass(frozen=True)
@@ -148,7 +149,7 @@ def _exists(wf, p) -> bool:
 
 
 def raw_edits(wf: Block, limits: Limits, allowed_steps=None, allowed_fragments=None) -> list:
-    allowed_steps = set(allowed_steps or (set(SKILL_SIGS) | set(TOOL_STEPS)))
+    allowed_steps = set(allowed_steps or (set(EDIT_SKILLS) | set(TOOL_STEPS)))
     allowed_fragments = set(FRAGMENTS) if allowed_fragments is None else set(allowed_fragments)
     out: list = []
     nodes = list(iter_nodes(wf))
@@ -215,7 +216,7 @@ def legal_edits(wf: Block, limits: Limits = Limits(), context: Callable[[Block],
     """All edits whose result is a legal workflow. `context(frag)` maps the object being edited
     to the full workflow that is validated (identity when editing a whole workflow)."""
     context = context or (lambda x: x)
-    allowed = set(allowed_steps or (set(SKILL_SIGS) | set(TOOL_STEPS)))
+    allowed = set(allowed_steps or (set(EDIT_SKILLS) | set(TOOL_STEPS)))
     seen, out = {to_str(wf)}, []
     for e in raw_edits(wf, limits, allowed, allowed_fragments):
         try:

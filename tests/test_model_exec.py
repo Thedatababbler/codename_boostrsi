@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-from farm.bench import gen_items
+from farm.adapter import gen_items
 from workflow.evaluate import evaluate, run_item
 from workflow.model import (Limits, parse_wf, to_str, validate, worst_case_calls)
 from workflow import baselines
@@ -30,7 +30,8 @@ class TestModel(unittest.TestCase):
         self.assertEqual(validate(baselines.best_of(5)), [])
 
     def test_constraints(self):
-        self.assertTrue(validate(parse_wf("seq[repair]")))                  # reads plan/diag first
+        self.assertTrue(validate(parse_wf("seq[repair]")))                  # reads diag before it is written
+        self.assertEqual(validate(parse_wf("seq[validate, repair]")), [])   # plan = y0 is readable from the start
         self.assertTrue(validate(parse_wf("seq[draft, repair]")))           # diag never written
         self.assertTrue(validate(parse_wf("seq[simulate]")))                # no plan writer
         self.assertTrue(validate(parse_wf("seq[draft, loop(k=2, stop=legal)[validate]]")))  # loop w/o plan
@@ -41,6 +42,11 @@ class TestModel(unittest.TestCase):
         wf = parse_wf("seq[draft, branch(status){illegal: seq[validate]}, repair]")
         self.assertTrue(validate(wf))
         self.assertEqual(validate(parse_wf("seq[draft, validate, branch(error_type){funds: seq[repair]}]")), [])
+        # a loop may run zero times (stop checked before each repetition) and gate writes are stage-local
+        self.assertTrue(validate(parse_wf("seq[loop(k=2, stop=legal)[validate, repair], repair]")))
+        self.assertTrue(validate(parse_wf("seq[gate[validate, repair], repair]")))
+        self.assertEqual(validate(parse_wf("seq[validate, loop(k=2, stop=legal)[validate, repair], repair]")), [])
+        self.assertEqual(validate(parse_wf("seq[fanout(n=2)[validate, repair], repair]")), [])
 
 
 class TestExec(unittest.TestCase):
@@ -48,6 +54,7 @@ class TestExec(unittest.TestCase):
         env = scripted_env({"draft": [ref_plan()], "improve": [LEGAL_LOW]})
         r = run_item(parse_wf("seq[draft, simulate, improve]"), ITEM, env)
         self.assertEqual(r.score, 1.0)
+        self.assertEqual(r.g, 1.0)
         self.assertEqual(r.cost.llm_calls, 1)          # improve never ran
         self.assertEqual(r.cost.tool_calls, {})        # simulate never ran
 
@@ -66,7 +73,7 @@ class TestExec(unittest.TestCase):
         env = scripted_env({"draft": [ILLEGAL], "repair": [LEGAL_LOW]})
         r = run_item(parse_wf("seq[draft, loop(k=3, stop=best)[validate, repair]]"), ITEM, env)
         self.assertEqual(r.cost.llm_calls, 4)
-        self.assertEqual(r.cost.scorer_calls, 4)
+        self.assertEqual(r.cost.scorer_calls, 7)       # 4 plan scores + 3 diagnoses
         self.assertEqual(r.cost.tool_calls, {"validate": 3})
 
     def test_branch_untaken_costs_nothing(self):
@@ -110,12 +117,11 @@ class TestExec(unittest.TestCase):
     def test_cache_replay_identical(self):
         items = gen_items(8, 5)
         with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "c.jsonl")
             for wf in (baselines.repair_loop(3), baselines.best_of(4)):
-                a = evaluate(wf, items, fake_env(path))
-                env = fake_env(path)                        # fresh process-equivalent, disk cache
+                a = evaluate(wf, items, fake_env(d))
+                env = fake_env(d)                           # fresh process-equivalent, disk cache
                 b = evaluate(wf, items, env)
-                self.assertEqual(env.llm.new_calls, 0)
+                self.assertEqual(env.llm.budget.new_calls, 0)
                 self.assertEqual([(r.score, r.cost.tokens, r.cost.llm_calls) for r in a],
                                  [(r.score, r.cost.tokens, r.cost.llm_calls) for r in b])
 
@@ -123,9 +129,9 @@ class TestExec(unittest.TestCase):
         items = gen_items(5, 9)
         env = fake_env()
         evaluate(baselines.best_of(2), items, env)
-        n0 = env.llm.new_calls
+        n0 = env.llm.budget.new_calls
         evaluate(baselines.best_of(4), items, env)
-        self.assertEqual(env.llm.new_calls - n0, 2 * len(items))   # only branches 3, 4 are new
+        self.assertEqual(env.llm.budget.new_calls - n0, 2 * len(items))   # only branches 3, 4 are new
 
 
 if __name__ == "__main__":

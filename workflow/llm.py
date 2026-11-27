@@ -1,110 +1,50 @@
-"""LLM clients: disk cache, concurrency limit, OpenAI-compatible endpoint (e.g. vLLM Qwen3-14B).
+"""LLM access = boosttopo's client and cache (revision §12): boosttopo.llm.CachedLLM over OpenAICompatLLM.
 
-No credentials are looked up anywhere: the endpoint URL / key are passed in explicitly.
+Cache keys are boosttopo's (model name incl. generation settings and llm.cache_tag, prompt hash, temperature,
+Request.rep), so workflow steps that send a multi-agent request hit the multi-agent cache. No credentials are
+looked up: the client is built with api_key=None (vLLM on localhost needs none); unlike boosttopo.llm.build_llm,
+no environment variable is read.
 """
 from __future__ import annotations
 
-import hashlib
-import json
-import os
-import threading
-import time
-import urllib.request
-from dataclasses import dataclass
+from boosttopo.llm import CachedLLM, OpenAICompatLLM
 
 
-@dataclass
-class Usage:
-    prompt_tokens: int = 0
-    completion_tokens: int = 0   # includes thinking tokens
-    cached: bool = False
+class CacheMiss(RuntimeError):
+    pass
 
 
-class LLM:
-    model = "base"
+class CacheOnly:
+    """Inner client that refuses to generate: wrapping makes a CachedLLM serve the cache or raise CacheMiss.
+    Keeps the wrapped client's name and generation settings, so the cache-key model name is unchanged."""
 
-    def generate(self, prompt: str, seed: int) -> tuple[str, Usage]:
-        raise NotImplementedError
+    def __init__(self, inner):
+        self.inner = inner
+        self.name = inner.name
+        self.temperature = inner.temperature
+        self.max_tokens = getattr(inner, "max_tokens", None)
+        self.extra_body = getattr(inner, "extra_body", None)
+        self.misses = 0
 
-
-def cache_key(model: str, prompt: str, seed: int) -> str:
-    return hashlib.sha256(json.dumps([model, prompt, seed]).encode()).hexdigest()
-
-
-class CachedLLM(LLM):
-    """Wraps an LLM with a JSONL disk cache and a concurrency limit.
-
-    The key is (model, prompt, seed); the seed is derived from the step's tree path and loop /
-    fanout indices (exec.Ctx.seed), so the same step at a different position or iteration is a
-    different key (§4.1). Cache hits return the original usage so cost accounting is identical
-    to a live run; `new_calls` counts actual model invocations.
-    """
-
-    def __init__(self, inner: LLM, path: str | None = None, max_concurrency: int = 4):
-        self.inner, self.path, self.model = inner, path, inner.model
-        self._mem: dict[str, dict] = {}
-        self._lock = threading.Lock()
-        self._sem = threading.Semaphore(max_concurrency)
-        self.new_calls = 0
-        self.hits = 0
-        if path and os.path.exists(path):
-            with open(path) as f:
-                for line in f:
-                    if line.strip():
-                        r = json.loads(line)
-                        self._mem[r["key"]] = r
-
-    def generate(self, prompt: str, seed: int) -> tuple[str, Usage]:
-        k = cache_key(self.model, prompt, seed)
-        with self._lock:
-            if k in self._mem:
-                self.hits += 1
-                r = self._mem[k]
-                return r["text"], Usage(r["pt"], r["ct"], cached=True)
-        with self._sem:
-            text, u = self.inner.generate(prompt, seed)
-        rec = {"key": k, "seed": seed, "text": text, "pt": u.prompt_tokens, "ct": u.completion_tokens}
-        with self._lock:
-            self._mem[k] = rec
-            self.new_calls += 1
-            if self.path:
-                os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-                with open(self.path, "a") as f:
-                    f.write(json.dumps(rec) + "\n")
-        return text, u
+    def call(self, req):
+        self.misses += 1
+        raise CacheMiss(f"not in cache: role={req.role} rep={req.rep} item={getattr(req.item, 'item_id', None)}")
 
 
-class OpenAICompatLLM(LLM):
-    """Chat-completions client for an OpenAI-compatible server (vLLM, SGLang, ...)."""
-
-    def __init__(self, base_url: str, model: str, api_key: str | None = None,
-                 temperature: float = 0.6, top_p: float = 0.95, max_tokens: int = 32768,
-                 enable_thinking: bool = True, timeout: float = 3600, retries: int = 3):
-        self.base_url, self.model, self.api_key = base_url.rstrip("/"), model, api_key
-        self.kw = dict(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
-        self.enable_thinking, self.timeout, self.retries = enable_thinking, timeout, retries
-
-    def generate(self, prompt: str, seed: int) -> tuple[str, Usage]:
-        body = {"model": self.model, "messages": [{"role": "user", "content": prompt}],
-                "seed": seed, **self.kw,
-                "chat_template_kwargs": {"enable_thinking": self.enable_thinking}}
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        err = None
-        for attempt in range(self.retries):
-            try:
-                req = urllib.request.Request(f"{self.base_url}/chat/completions",
-                                             data=json.dumps(body).encode(), headers=headers)
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    out = json.loads(resp.read())
-                msg = out["choices"][0]["message"]
-                text = msg.get("content") or ""
-                if msg.get("reasoning_content"):
-                    text = f"<think>{msg['reasoning_content']}</think>{text}"
-                u = out.get("usage", {})
-                return text, Usage(u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
-            except Exception as e:  # noqa: BLE001
-                err = e
-                time.sleep(2 ** attempt)
-        raise RuntimeError(f"LLM call failed after {self.retries} attempts: {err}")
+def make_llm(cfg, cache_only: bool = False) -> CachedLLM:
+    """cfg: a boosttopo Cfg (configs/*.yaml + --set). llm.kind: openai | fake (the toy farm model)."""
+    lc = cfg.llm
+    if lc.kind == "fake" and cfg.bench.game == "toy":  # boosttopo's own toy benchmark and fake model
+        from boosttopo.bench.toy import toy_rule
+        from boosttopo.llm import FakeLLM
+        inner = FakeLLM(toy_rule)
+    elif lc.kind == "fake":
+        from farm.fake import FakeFarmLLM
+        inner = FakeFarmLLM()
+    else:
+        inner = OpenAICompatLLM(lc.api_base, lc.model, api_key=None, temperature=lc.temperature,
+                                max_tokens=lc.max_tokens, timeout=lc.timeout, max_concurrency=lc.max_concurrency,
+                                extra_body=lc.get("extra_body"))
+    if cache_only:
+        inner = CacheOnly(inner)
+    return CachedLLM(inner, cfg.cache_dir, tag=lc.get("cache_tag"), y0_tags=tuple(lc.get("y0_cache_tags") or ()))

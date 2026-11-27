@@ -1,24 +1,19 @@
-"""A deterministic fake model for the toy Farm task (tests, dry runs, toy boosting experiments).
+"""A deterministic fake model for the toy Farm game (tests and fake dry runs only).
 
-It reads the skill name and slots from the rendered prompt and behaves like a noisy planner:
-drafts contain injected mistakes, repair fixes the first reported error most of the time,
-improve fills idle land — more reliably when simulation feedback is in the prompt, and drafts
-pick better crops when crop_stats is in the prompt. Outputs depend only on (prompt, seed).
+It is an inner LLM for boosttopo.llm.CachedLLM: `call(req) -> (text, tokens)`. It reads the structured request
+(role, item payload, current plan, diagnosis, upstream roles) and behaves like a noisy planner: drafts contain
+injected mistakes, repairs fix the first reported error most of the time, improvements fill idle land, more
+reliably when a simulation section or analyst notes are in the prompt. Outputs depend only on (prompt, rep).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import re
 
-from farm.rules import simulate
-
-from .llm import LLM, Usage
-
-
-def _slot(prompt: str, tag: str) -> str:
-    m = re.search(rf"<{tag}>\n(.*?)\n?</{tag}>", prompt, re.S)
-    return m.group(1).strip() if m else ""
+from .adapter import plan_list
+from .rules import simulate
 
 
 def _sort(plan: list) -> list:
@@ -26,32 +21,46 @@ def _sort(plan: list) -> list:
 
 
 def _fence(plan: list) -> str:
-    return "```json\n" + json.dumps(_sort(plan)) + "\n```"
+    return "Ledger: (fake)\n```json\n" + json.dumps(_sort(plan)) + "\n```"
 
 
-class FakeFarmLLM(LLM):
-    model = "fake-farm-v1"
+class FakeFarmLLM:
+    name = "fake-farm-v2"
+    temperature = 0.7
 
     def __init__(self, err_rate: float = 0.12, think_tokens: tuple = (1500, 5000)):
         self.err_rate, self.think_tokens = err_rate, think_tokens
-        self.calls = 0
+        self.n_calls = 0
 
-    def generate(self, prompt: str, seed: int) -> tuple[str, Usage]:
-        self.calls += 1
-        rng = random.Random(seed)
-        skill = re.search(r"### SKILL: (\w+)", prompt).group(1)
-        P = json.loads(_slot(prompt, "problem"))
-        if skill == "draft":
-            out = _fence(self._draft(P, rng, bool(_slot(prompt, "crop_stats"))))
-        elif skill == "repair":
-            out = _fence(self._repair(P, _load(_slot(prompt, "plan")), _slot(prompt, "diagnosis"), rng))
-        elif skill == "improve":
-            out = _fence(self._improve(P, _load(_slot(prompt, "plan")), rng, bool(_slot(prompt, "simulation"))))
-        else:
-            best = max(P["crops"], key=lambda k: (P["crops"][k]["price"] - P["crops"][k]["cost"]) / P["crops"][k]["grow"])
+    def call(self, req) -> tuple[str, int]:
+        text, tokens, _ = self.call_meta(req)
+        return text, tokens
+
+    def call_meta(self, req):
+        self.n_calls += 1
+        rng = random.Random(int(hashlib.sha256(f"{req.rep}|{req.prompt}".encode()).hexdigest()[:12], 16))
+        P = req.item.payload["toy"]
+        role = req.role
+        up = {r for r, _ in req.upstream}
+        informed = "analyst" in up or "=== CROP STATS" in req.prompt
+        cur = _load(req.y_cur)
+        if role == "y0":
+            out = _fence(self._draft(P, rng, False))
+        elif role in ("analyst", "critic"):
+            crops = P["crops"]
+            best = max(crops, key=lambda k: (crops[k]["price"] - crops[k]["cost"]) / crops[k]["grow"])
             out = f"Prefer {best}; harvest on maturity and replant immediately; keep cash for seeds."
+        elif role == "repairer":
+            out = _fence(self._repair(P, cur, req.diag or "", rng) if not simulate(P, cur).legal or not cur
+                         else self._improve(P, cur, rng, False))
+        elif role == "improve":
+            out = _fence(self._improve(P, cur, rng, "=== SIMULATION" in req.prompt))
+        else:  # writer: a new plan, starting from the current one when it is legal
+            out = _fence(self._improve(P, cur, rng, informed) if cur and simulate(P, cur).legal
+                         else self._draft(P, rng, informed))
         ct = rng.randint(*self.think_tokens)
-        return f"<think>{'.' * 20}</think>{out}", Usage(len(prompt) // 4, ct)
+        pt = len(req.prompt) // 4
+        return out, pt + ct, {"prompt_tokens": pt, "completion_tokens": ct}
 
     # ------------------------------------------------------------------ skills
     def _draft(self, P, rng, informed: bool) -> list:
@@ -96,8 +105,8 @@ class FakeFarmLLM(LLM):
             return plan  # nothing found / failed to fix
         a = dict(plan[idx])
         crops = P["crops"]
-        kind = re.search(r"\[(\w+)\]", diag)
-        kind = kind.group(1) if kind else "other"
+        kind = ("funds" if "costs" in diag else "farmland" if "idle plots" in diag
+                else "not_mature" if "mature" in diag else "other")
         if rng.random() < 0.2:
             del plan[idx]  # crude fix: drop the action (may cascade)
             return plan
@@ -157,9 +166,7 @@ class FakeFarmLLM(LLM):
 
 def _load(s: str) -> list:
     try:
-        a, b = s.find("["), s.rfind("]")
-        v = json.loads(s[a:b + 1])
-        return [x for x in v if isinstance(x, dict) and isinstance(x.get("day"), int)]
+        return [x for x in plan_list(s or "") if isinstance(x, dict) and isinstance(x.get("day"), int)]
     except Exception:  # noqa: BLE001
         return []
 

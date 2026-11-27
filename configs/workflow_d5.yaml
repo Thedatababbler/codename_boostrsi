@@ -1,0 +1,38 @@
+# Single-agent Boosted Workflow on the real Farm benchmark, d5 (revision §12 of the design doc).
+# LLM settings are those of configs/r4_d5.yaml (Qwen3-14B, thinking on, fp8 KV cache tag kvfp8), so requests that
+# are the multi-agent ones hit the multi-agent cache. The test split's y0 are the calibration's cached (untagged)
+# records, read through llm.y0_cache_tags; a missing one aborts (workflow.require_cached_y0).
+seed: 0
+lam: auto
+accept_margin: 0.01
+llm:
+  kind: openai
+  api_base: http://127.0.0.1:8401/v1
+  model: qwen3-14b
+  temperature: 0.7
+  max_tokens: 30000
+  max_concurrency: 24
+  timeout: 7200
+  extra_body: {chat_template_kwargs: {enable_thinking: true}}
+  cache_tag: kvfp8
+  y0_cache_tags: [null]
+cache_dir: cache
+bench:
+  game: farm
+  train:   {difficulty: 5, seeds: [1000, 1012]}
+  heldout: {difficulty: 5, seeds: [2000, 2030]}
+  dev_tests:
+    test_d5: {difficulty: 5, seeds: [6000, 6040]}   # = the 40 calibration items; the pre-check split
+workflow:
+  seed_scheme: path        # path (new structures) | legacy (multi-agent repeat indices; replay baselines)
+  diag_mode: clean         # clean | original (replay check only, never in a new comparison)
+  start: y0                # y0 | empty (kept for later; not run)
+  max_calls: 12
+  require_cached_y0: [test_d5]
+boost:
+  rounds: 4
+  patience: 2
+  max_steps: 4
+  top_k: 3
+  fresh_after_reject: true
+search: {min_gain: 0.005}

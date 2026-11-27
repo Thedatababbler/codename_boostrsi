@@ -1,0 +1,13 @@
+# Fake dry run on the toy Farm game (tests / plumbing only; numbers are meaningless).
+seed: 0
+lam: auto
+llm: {kind: fake, max_concurrency: 8, temperature: 0.7}
+cache_dir: runs/cache_toy
+bench:
+  game: farm-toy
+  train:   {difficulty: 5, seeds: [100, 112]}
+  heldout: {difficulty: 5, seeds: [200, 230]}
+  dev_tests:
+    test_d5: {difficulty: 5, seeds: [300, 340]}
+  final_tests: {}
+workflow: {require_cached_y0: []}

@@ -1,54 +1,53 @@
-# Boosted Workflow — single-agent version
+# Boosted Topology (multi-agent) and Boosted Workflow (single-agent)
 
-This implements 《Boosted Workflow：单智能体版本实现文档》. The object being optimised is a workflow
-of one agent calling skills, tools and checks over a shared state. The workflow is grown stage by
-stage, with serial (GBDT-style) or branch (AdaBoost-style) boosting. Pure Python 3.11 standard
-library; no dependencies.
+Two implementations share this repo:
 
-**Read `docs/IMPLEMENTATION_NOTES.md` first.** The original repo (`~/projects/boostrsi_next`) was
-not available, so the benchmark here is a *toy* Farm game and the old prompts are stand-ins.
+- `src/boosttopo/`: the multi-agent version (role subgraphs, GBDT / AdaBoost). Its notes are in
+  `docs/IMPLEMENTATION_NOTES.md`, its interfaces in `docs/interfaces.md`, its presets in `configs/*.yaml`.
+- `workflow/` + `boost/`: the single-agent version of 《Boosted Workflow：单智能体版本实现文档》, integrated with
+  boosttopo (branch `workflow-integration`, revision §12). **Read `docs/IMPLEMENTATION_NOTES_workflow.md` first.**
 
-## Layout
+The single-agent version reuses boosttopo's benchmark adapter (`FarmAdapter`), LLM client and cache
+(`CachedLLM`, keys unchanged), config (YAML + `--set`), `RunLog` and `per_item.jsonl`. The role prompts are the
+multi-agent ones, unchanged. `farm/` is a toy Farm game for tests and fake dry runs only.
+
+## Layout (single-agent)
 
 | Path | Doc § | What |
 |---|---|---|
-| `workflow/model.py` | §2 | `State`, `Step`, `Block`, legality checks, `worst_case_calls`, text form `parse`/`to_str` |
-| `workflow/exec.py` | §4 | recursive interpreter, cost accounting, path-derived seeds |
-| `workflow/tools.py` | §3.2 | `validate`, `simulate`, `crop_stats`, `reset_to_best`; checks `status`, `error_type` |
-| `workflow/skills.py` | §3.1 | prompt templates `draft`, `repair`, `improve`, `analyze` with fixed tool slots |
-| `workflow/llm.py` | §4.3 | JSONL cache + concurrency limit; OpenAI-compatible client (vLLM / Qwen3-14B) |
-| `workflow/fake.py` | — | deterministic fake model for tests and dry runs |
-| `workflow/evaluate.py` | §4.2 | evaluation entry, g, frozen-prefix reuse |
-| `workflow/edits.py` | §5.1–5.2 | atomic edits, fragments, `legal_edits`, `apply_edit` |
-| `workflow/proposer.py`, `policy.py` | §5.3 | 3-slot `WorkflowProposer`, residual-source policy f0 |
-| `workflow/grow.py` | §6.1 | `grow_fragment` |
-| `boost/serial.py`, `boost/branch.py` | §6.2–6.4 | the two boosting modes and the acceptance test |
-| `boost/global_search.py` | §8.3 | "no stages" ablation |
-| `workflow/baselines.py` | §7.1–7.2, §8.1 | F1–F3, B1–B3, token-aligned baselines (all are workflows) |
-| `scripts/precheck.py` | §7 | S1 pre-check and gate |
-| `scripts/run_boost.py` | S2–S4 | search, then a test report against the cost-aligned baselines |
-| `scripts/report.py` | §8.2 | metrics, breakdown, structure and usage from a saved JSON |
-| `farm/` | — | toy benchmark: rules, scorer, reference solver (tools may not import it) |
+| `workflow/model.py` | §2 | `State`, `Step`, `Block` (seq / loop / branch / fanout / gate), legality checks, text form |
+| `workflow/exec.py` | §4, §12 | interpreter: start from y0, loop / gate semantics, seed schemes `path` / `legacy` |
+| `workflow/tools.py` | §3, §12 | `validate` (diag modes clean / original), `simulate`, `crop_stats`; checks `status`, `error_type` |
+| `workflow/skills.py` | §3.1, §12 | requests: writer / repairer / analyst / critic role prompts unchanged; `improve` new |
+| `workflow/llm.py` | §4.3 | builds boosttopo's `CachedLLM`; `CacheOnly` for no-model-call replay |
+| `workflow/evaluate.py` | §4.2 | y0 via `call_y0` (missing test y0 aborts), g = `evalx.gap_closure`, frozen prefixes |
+| `workflow/legacy.py` | §12 | multi-agent methods / ensembles written as workflows (for cache replay) |
+| `workflow/edits.py`, `proposer.py`, `policy.py`, `grow.py` | §5, §6.1 | edit set, 3-slot proposer, f0 |
+| `boost/serial.py`, `boost/branch.py`, `boost/global_search.py` | §6, §8.3 | boosting modes, checkpoint / resume |
+| `workflow/baselines.py` | §7, §8.1 | F1–F3, B1–B3, token-aligned baselines |
+| `scripts/precheck.py` | §7 | S1 pre-check and gate; `--estimate` = cache-only call estimate |
+| `scripts/run_boost.py` | S2–S4 | search, then the test report against the cost-aligned baselines |
+| `scripts/replay_check.py` | §12 | cache-only acceptance checks (a)–(c) against a stored multi-agent run |
+| `scripts/report_workflow.py` | §8.2 | tables from a saved precheck.json / test.json |
+| `farm/` | — | toy Farm game with FarmAdapter's interface, fake model (tests only) |
 
 ## Run
 
 ```bash
-# tests (W1–W7 acceptance checks that can be run without the original repo)
-PYTHONPATH=.:tests python3.11 -m unittest discover -s tests
+# one test runner for both packages (needs pyyaml, pytest)
+python -m pytest -q
 
-# S1 pre-check: estimate first, then the fake dry run, then the real model
-python3.11 scripts/precheck.py --estimate --calls-per-hour 64
-python3.11 scripts/precheck.py --llm fake --out runs/precheck_fake
-python3.11 scripts/precheck.py --llm openai --base-url http://localhost:8000/v1 \
-    --model Qwen/Qwen3-14B --concurrency 2 --cache runs/cache/qwen3.jsonl --out runs/precheck
-python3.11 scripts/report.py runs/precheck/precheck.json
+# acceptance before any model call (needs the stored cache/ and runs/, and third_party/SelfImprove-Bench)
+python scripts/replay_check.py --run-dir runs/r4_d5 --split test_d5
+python scripts/precheck.py --config configs/workflow_d5.yaml --estimate
 
-# S2 / S3 / S4 (refuse to start unless the pre-check passed)
-python3.11 scripts/run_boost.py --mode serial --precheck runs/precheck/summary.json [model args]
-python3.11 scripts/run_boost.py --mode branch --precheck runs/precheck/summary.json [model args]
-python3.11 scripts/run_boost.py --mode branch --no-residual ...   # ablation: no residual
-python3.11 scripts/run_boost.py --mode global --eval-budget N ... # ablation: no stages
-python3.11 scripts/run_boost.py --mode serial --no-tools ...      # ablation: no tools
+# fake dry runs
+python scripts/precheck.py --config configs/workflow_toy.yaml
+python scripts/run_boost.py --config configs/workflow_toy.yaml --mode serial --skip-gate
+
+# the real pre-check (one model job at a time), then S2-S4 (refuse to start unless it passed)
+python scripts/precheck.py --config configs/workflow_d5.yaml
+python scripts/run_boost.py --config configs/workflow_d5.yaml --mode branch --precheck runs/precheck_workflow_d5/summary.json
 ```
 
 Workflows are written in the doc's notation, for example:

@@ -18,6 +18,8 @@ def fit_global(train, heldout, env: Env, cfg: BoostCfg = BoostCfg(), eval_budget
     policy = policy or F0Policy(salt=cfg.run_seed)
     proposer = proposer or WorkflowProposer(cfg.limits, cfg.allowed_steps(), cfg.allowed_fragments())
     wf = seq(make_step("draft"))
+    from .common import resolve_lam
+    resolve_lam(cfg, env, train)
 
     def fitness(w):
         rs = evaluate(w, train, env, cfg.run_seed)
